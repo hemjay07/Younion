@@ -13,7 +13,7 @@ module.exports = {
   babylon: {
     id: "bbn-test-5",
     name: "Babylon Testnet",
-    sourceChannelId: 10, // Updated from 9 to 10 based on UI transaction
+    sourceChannelId: 7, // Updated from 9 to 10 based on UI transaction
     prefix: "bbn",
   },
 

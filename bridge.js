@@ -45,25 +45,9 @@ const argv = yargs(hideBin(process.argv))
     type: "string",
     default: "0.000001",
   })
-  .option("senderKey", {
-    alias: "sk",
-    description: "Sender private key (or use .env file)",
-    type: "string",
-  })
-  .option("senderKeyFile", {
-    alias: "skf",
-    description: "File containing sender private keys (one per line)",
-    type: "string",
-  })
-  .option("receiver", {
-    alias: "r",
-    description: "Receiver address",
-    type: "string",
-    demandOption: true,
-  })
   .option("count", {
     alias: "c",
-    description: "Number of transactions to send",
+    description: "Number of transactions per wallet",
     type: "number",
     default: 1,
   })
@@ -100,12 +84,99 @@ const argv = yargs(hideBin(process.argv))
     type: "boolean",
     default: false,
   })
+  .option("maxParallel", {
+    description: "Maximum number of parallel wallet executions",
+    type: "number",
+    default: 3,
+  })
   .help()
   .alias("help", "h")
   .parse();
 
 // Provider cache to avoid creating new connections
 const providerCache = new Map();
+
+// Transaction nonce tracker per wallet
+const nonceTrackers = new Map();
+
+// Wallet locks to ensure sequential processing per wallet
+const walletLocks = new Map();
+
+// Simple async lock implementation
+class AsyncLock {
+  constructor() {
+    this.locked = false;
+    this.queue = [];
+  }
+
+  async acquire() {
+    if (!this.locked) {
+      this.locked = true;
+      return;
+    }
+
+    return new Promise((resolve) => {
+      this.queue.push(resolve);
+    });
+  }
+
+  release() {
+    if (this.queue.length > 0) {
+      const resolve = this.queue.shift();
+      resolve();
+    } else {
+      this.locked = false;
+    }
+  }
+}
+
+// Class to manage parallel execution
+class ConcurrencyManager {
+  constructor(maxConcurrent = 3) {
+    this.maxConcurrent = maxConcurrent;
+    this.running = 0;
+    this.queue = [];
+  }
+
+  async schedule(fn) {
+    if (this.running < this.maxConcurrent) {
+      return this.runTask(fn);
+    }
+
+    return new Promise((resolve, reject) => {
+      this.queue.push({
+        task: fn,
+        resolve,
+        reject,
+      });
+    });
+  }
+
+  async runTask(fn) {
+    this.running++;
+    try {
+      return await fn();
+    } finally {
+      this.running--;
+      this.processQueue();
+    }
+  }
+
+  processQueue() {
+    if (this.queue.length > 0 && this.running < this.maxConcurrent) {
+      const { task, resolve, reject } = this.queue.shift();
+      this.runTask(task).then(resolve).catch(reject);
+    }
+  }
+
+  getStats() {
+    return {
+      running: this.running,
+      queued: this.queue.length,
+      maxConcurrent: this.maxConcurrent,
+    };
+  }
+}
 
 // Suppress internal ethers.js connection logs if requested
 if (argv.suppressConnectionLogs) {
@@ -179,33 +250,69 @@ async function withTimeout(promise, timeoutMs, errorMessage) {
   }
 }
 
-// Load sender private keys
-const loadSenderKeys = () => {
-  const keys = [];
+// Load wallet configurations from .env
+function loadWalletConfigurations() {
+  const wallets = [];
 
-  // Add key from command line if provided
-  if (argv.senderKey) {
-    keys.push(argv.senderKey);
+  // We support up to 5 wallets
+  for (let i = 1; i <= 5; i++) {
+    const privateKeyVar = `WALLET_${i}_PRIVATE_KEY`;
+    const unionAddressVar = `WALLET_${i}_UNION_ADDRESS`;
+    const babylonAddressVar = `WALLET_${i}_BABYLON_ADDRESS`;
+
+    if (process.env[privateKeyVar]) {
+      const wallet = {
+        privateKey: process.env[privateKeyVar],
+        unionAddress: process.env[unionAddressVar],
+        babylonAddress: process.env[babylonAddressVar],
+      };
+
+      // Validate wallet configuration
+      if (!wallet.unionAddress || !wallet.babylonAddress) {
+        log(
+          `Warning: Wallet ${i} is missing destination addresses. Skipping.`,
+          true
+        );
+        continue;
+      }
+
+      // Validate address formats
+      if (!wallet.unionAddress.startsWith("union")) {
+        log(
+          `Warning: Wallet ${i} has invalid Union address format. Skipping.`,
+          true
+        );
+        continue;
+      }
+
+      if (!wallet.babylonAddress.startsWith("bbn")) {
+        log(
+          `Warning: Wallet ${i} has invalid Babylon address format. Skipping.`,
+          true
+        );
+        continue;
+      }
+
+      wallets.push(wallet);
+    }
   }
 
-  // Add key from .env if available
-  if (process.env.SENDER_PRIVATE_KEY) {
-    keys.push(process.env.SENDER_PRIVATE_KEY);
-  }
+  return wallets;
+}
 
-  // Add keys from file if provided
-  if (argv.senderKeyFile && fs.existsSync(argv.senderKeyFile)) {
-    const fileContent = fs.readFileSync(argv.senderKeyFile, "utf8");
-    const fileKeys = fileContent
-      .split("\n")
-      .map((line) => line.trim())
-      .filter((line) => line && line.startsWith("0x") && line.length >= 64);
-    keys.push(...fileKeys);
-  }
+// Get the appropriate receiver address for a wallet based on destination
+function getReceiverAddress(wallet, destination) {
+  // Normalize destination to lowercase for case-insensitive comparison
+  const normalizedDestination = destination.toLowerCase();
 
-  // Remove duplicates
-  return [...new Set(keys)];
-};
+  if (normalizedDestination.includes("union")) {
+    return wallet.unionAddress;
+  } else if (normalizedDestination.includes("babylon")) {
+    return wallet.babylonAddress;
+  } else {
+    throw new Error(`Unknown destination chain: ${destination}`);
+  }
+}
 
 // Helper function to check if an error is related to connection issues
 function isConnectionError(errorMsg) {
@@ -231,6 +338,76 @@ function isConnectionError(errorMsg) {
   return connectionErrorPatterns.some((pattern) =>
     errorMsg.toString().toLowerCase().includes(pattern.toLowerCase())
   );
+}
+
+// Helper function to check if an error is related to nonce issues
+function isNonceError(errorMsg) {
+  if (!errorMsg) return false;
+
+  const nonceErrorPatterns = [
+    "nonce too low",
+    "nonce has already been used",
+    "transaction underpriced",
+    "NONCE_EXPIRED",
+    "already known",
+    "replacement transaction underpriced",
+    "INTERNAL_ERROR: nonce",
+  ];
+
+  return nonceErrorPatterns.some((pattern) =>
+    errorMsg.toString().toLowerCase().includes(pattern.toLowerCase())
+  );
+}
+
+// Get the next nonce for a wallet with improved management
+async function getNextNonce(wallet, forceNetworkQuery = false) {
+  const address = wallet.address;
+
+  // Get or create a lock for this wallet
+  if (!walletLocks.has(address)) {
+    walletLocks.set(address, new AsyncLock());
+  }
+
+  const lock = walletLocks.get(address);
+
+  // Acquire the lock to ensure nonce consistency
+  await lock.acquire();
+
+  try {
+    if (forceNetworkQuery || !nonceTrackers.has(address)) {
+      try {
+        // Get the current nonce from the network
+        const networkNonce = await wallet.getNonce();
+
+        // Always update our tracker with the network nonce
+        nonceTrackers.set(address, networkNonce);
+        log(
+          `Set nonce for ${address.substring(0, 8)}... to ${networkNonce}`,
+          true
+        );
+
+        return networkNonce;
+      } catch (error) {
+        logError(
+          `Failed to get nonce from network for ${address}: ${error.message}`
+        );
+
+        // If we have a tracked nonce, use it as fallback
+        if (nonceTrackers.has(address)) {
+          return nonceTrackers.get(address);
+        }
+        throw error;
+      }
+    }
+
+    // Get the next nonce from our tracker
+    const currentNonce = nonceTrackers.get(address);
+    nonceTrackers.set(address, currentNonce + 1);
+    return currentNonce;
+  } finally {
+    // Always release the lock
+    lock.release();
+  }
 }
 
 // Perform a health check on RPC endpoints to identify the most reliable ones
@@ -457,11 +634,16 @@ async function executeBridgeTransaction(params) {
     destinationChain,
     token,
     amount,
-    senderKey,
-    receiverAddress,
+    walletConfig,
     batchId,
     transactionIndex,
   } = params;
+
+  const senderKey = walletConfig.privateKey;
+  const receiverAddress = getReceiverAddress(
+    walletConfig,
+    destinationChain.name
+  );
 
   let provider = null;
   let reconnectAttempts = 0;
@@ -771,11 +953,57 @@ async function executeBridgeTransaction(params) {
         true
       );
 
-      // Send transaction with reconnection logic
+      // Send transaction with reconnection logic and nonce management
       const progressSend = showProgress("Sending bridge transaction");
-      const txResponse = await executeWithReconnect(async () => {
-        return await wallet.sendTransaction(tx);
-      });
+
+      let txResponse;
+      let nonceRetries = 0;
+      const MAX_NONCE_RETRIES = 3;
+
+      // Always get fresh nonce from network for first attempt
+      let nonce = await getNextNonce(wallet, true);
+      log(`Using nonce: ${nonce}`, true);
+
+      while (!txResponse && nonceRetries <= MAX_NONCE_RETRIES) {
+        try {
+          txResponse = await executeWithReconnect(async () => {
+            // Add nonce to transaction
+            const txWithNonce = {
+              ...tx,
+              nonce: nonce,
+            };
+            return await wallet.sendTransaction(txWithNonce);
+          });
+        } catch (error) {
+          if (isNonceError(error.message)) {
+            nonceRetries++;
+            logError(
+              `Nonce error detected (attempt ${nonceRetries}/${MAX_NONCE_RETRIES}): ${error.message}`
+            );
+
+            // Get a fresh nonce from the network
+            nonce = await wallet.getNonce();
+            log(`Updated nonce from network: ${nonce}`, true);
+
+            // Also update our tracker
+            nonceTrackers.set(wallet.address, nonce + 1);
+
+            // Add a small delay before retrying
+            await sleep(1000);
+
+            // If we've reached max retries, give up
+            if (nonceRetries > MAX_NONCE_RETRIES) {
+              throw new Error(
+                `Failed to send transaction after ${MAX_NONCE_RETRIES} nonce retries: ${error.message}`
+              );
+            }
+          } else {
+            // Not a nonce error, rethrow
+            throw error;
+          }
+        }
+      }
+
       progressSend.complete("Sent");
 
       txHash = txResponse.hash;
@@ -843,8 +1071,8 @@ async function executeBridgeTransaction(params) {
   } catch (error) {
     logError(`Bridge transaction failed: ${error.message}`);
 
-    // Try to record failed transaction if we have the wallet address
-    if (params.senderKey) {
+    // Try to record failed transaction if we have the wallet config
+    if (walletConfig.privateKey) {
       try {
         // Try to create a minimal provider just for this operation
         const provider = new ethers.JsonRpcProvider(
@@ -859,13 +1087,9 @@ async function executeBridgeTransaction(params) {
             staticNetwork: true,
           }
         );
-        const wallet = getWallet(params.senderKey, provider);
+        const wallet = getWallet(walletConfig.privateKey, provider);
 
-        counter.recordTransaction(
-          wallet.address,
-          params.destinationChain.name,
-          false
-        );
+        counter.recordTransaction(wallet.address, destinationChain.name, false);
 
         // Record detailed transaction failure
         await recordTransaction({
@@ -894,116 +1118,149 @@ async function executeBridgeTransaction(params) {
   }
 }
 
-// Execute a batch of transactions
-async function executeBatch(params) {
+// Execute transactions for all wallets with strict sequential processing per wallet
+async function executeParallelTransactions(params) {
   const {
     sourceChain,
     destinationChain,
     token,
     amount,
-    senderKeys,
-    receiverAddress,
+    walletConfigs,
     count,
-    batchSize,
     delay,
     batchId,
+    maxParallel,
   } = params;
 
   log(
-    `\n===== Starting batch ${batchId} with ${count} transactions =====`,
+    `\n===== Starting batch ${batchId} with ${count} transactions per wallet (${walletConfigs.length} wallets) =====`,
     true
   );
 
+  // If we only have one wallet, use a completely sequential approach
+  const isSequential = walletConfigs.length === 1;
+
+  // For multiple wallets, use the concurrency manager to parallelize between wallets
+  const concurrencyManager = new ConcurrencyManager(
+    isSequential ? 1 : Math.min(maxParallel, walletConfigs.length)
+  );
+
+  if (isSequential) {
+    log(
+      `Single wallet detected: Using fully sequential processing to avoid nonce conflicts`,
+      true
+    );
+  } else {
+    log(
+      `Multiple wallets detected: Using parallel processing between wallets (max ${concurrencyManager.maxConcurrent})`,
+      true
+    );
+  }
+
   const results = {
-    total: count,
+    total: count * walletConfigs.length,
     successful: 0,
     failed: 0,
     transactions: [],
   };
 
-  // Round-robin through sender keys
-  for (let i = 0; i < count; i++) {
-    const senderKey = senderKeys[i % senderKeys.length];
-    let attempts = 0;
-    const maxAttempts = 3;
-    let success = false;
+  // Track progress
+  let completed = 0;
+  const updateProgress = () => {
+    const stats = concurrencyManager.getStats();
+    process.stdout.write(
+      `\rProgress: ${completed}/${results.total} completed | ${stats.running} running | ${stats.queued} queued`
+    );
+  };
 
-    while (attempts < maxAttempts && !success) {
-      attempts++;
-      try {
-        const result = await executeBridgeTransaction({
-          sourceChain,
-          destinationChain,
-          token,
-          amount,
-          senderKey,
-          receiverAddress,
-          batchId,
-          transactionIndex: i,
-        });
+  // Process each wallet's transactions in their own sequence
+  const walletPromises = walletConfigs.map((walletConfig) => {
+    // Each wallet gets scheduled as a single unit of work in the concurrency manager
+    return concurrencyManager.schedule(async () => {
+      // For each wallet, process all its transactions sequentially
+      for (let i = 0; i < count; i++) {
+        updateProgress();
 
-        results.transactions.push(result);
+        // Execute with retry logic
+        let attempts = 0;
+        const maxAttempts = 3;
+        let success = false;
+        let result;
 
-        if (result.success) {
-          results.successful++;
-          success = true;
-        } else {
-          // If it's not a connection error, don't retry
-          if (!result.error || !isConnectionError(result.error)) {
-            results.failed++;
-            break;
+        const transactionIndex =
+          i + walletConfigs.indexOf(walletConfig) * count;
+
+        while (attempts < maxAttempts && !success) {
+          attempts++;
+          try {
+            result = await executeBridgeTransaction({
+              sourceChain,
+              destinationChain,
+              token,
+              amount,
+              walletConfig,
+              batchId,
+              transactionIndex,
+            });
+
+            if (result.success) {
+              success = true;
+              results.successful++;
+            } else if (
+              !result.error ||
+              (!isConnectionError(result.error) && !isNonceError(result.error))
+            ) {
+              results.failed++;
+              break;
+            } else {
+              // For connection or nonce errors, we retry
+              log(
+                `Transaction attempt ${attempts}/${maxAttempts} failed with error: ${result.error}. Retrying...`
+              );
+              await sleep(delay * attempts);
+            }
+          } catch (error) {
+            if (
+              !isConnectionError(error.message) &&
+              !isNonceError(error.message)
+            ) {
+              results.failed++;
+              result = { success: false, error: error.message };
+              break;
+            }
+
+            if (attempts === maxAttempts) {
+              results.failed++;
+              result = { success: false, error: error.message };
+            }
+
+            await sleep(delay * attempts);
           }
-
-          // For connection errors, we retry
-          logError(
-            `Transaction attempt ${attempts}/${maxAttempts} failed with connection error. Retrying...`
-          );
-
-          // Wait longer before retrying
-          await sleep(delay * attempts);
         }
-      } catch (error) {
-        logError(
-          `Error executing transaction ${
-            i + 1
-          } (attempt ${attempts}/${maxAttempts}): ${error.message}`
+
+        results.transactions.push(
+          result || { success: false, error: "Unknown error" }
         );
+        completed++;
+        updateProgress();
 
-        // If it's not a connection error, don't retry
-        if (!isConnectionError(error.message)) {
-          results.failed++;
-          results.transactions.push({
-            success: false,
-            error: error.message,
-          });
-          break;
+        // Add a delay between transactions from the same wallet
+        if (i < count - 1) {
+          await sleep(isSequential ? delay : Math.floor(delay / 2));
         }
-
-        // For the last attempt, record the failure
-        if (attempts === maxAttempts) {
-          results.failed++;
-          results.transactions.push({
-            success: false,
-            error: error.message,
-          });
-        }
-
-        // Wait longer before retrying
-        await sleep(delay * attempts);
       }
-    }
+    });
+  });
 
-    // Wait between transactions
-    if (i < count - 1) {
-      log(`Waiting ${delay}ms before next transaction...`);
-      await sleep(delay);
-    }
-  }
+  // Wait for all wallets to complete their transactions
+  await Promise.all(walletPromises);
+  process.stdout.write("\n"); // New line after progress indicator
 
   log(
     `\n===== Batch ${batchId} completed: ${results.successful} successful, ${results.failed} failed =====`,
     true
   );
+
   return results;
 }
 
@@ -1023,15 +1280,22 @@ async function main() {
       throw new Error(`Unknown token: ${argv.token}`);
     }
 
-    // Load sender keys
-    const senderKeys = loadSenderKeys();
-    if (senderKeys.length === 0) {
+    // Load wallet configurations from .env
+    const walletConfigs = loadWalletConfigurations();
+    if (walletConfigs.length === 0) {
       throw new Error(
-        "No sender private keys provided. Use --senderKey, --senderKeyFile, or set SENDER_PRIVATE_KEY in .env"
+        "No wallet configurations found in .env file. Please add at least one wallet configuration."
       );
     }
 
-    log(`Loaded ${senderKeys.length} sender keys`, true);
+    log(`Loaded ${walletConfigs.length} wallet configurations`, true);
+
+    // Validate that we don't have too many wallets
+    if (walletConfigs.length > 5) {
+      throw new Error(
+        "Too many wallet configurations. Maximum of 5 wallets allowed."
+      );
+    }
 
     // Get chain and token configurations
     const sourceChain = chains[argv.source];
@@ -1111,131 +1375,63 @@ async function main() {
       log("RPC health check skipped as requested", true);
     }
 
-    // Calculate number of batches
-    const totalTransactions = argv.count;
-    const batchSize = Math.min(argv.batchSize, 10); // Limit batch size to 10 for stability
-    const numBatches = Math.ceil(totalTransactions / batchSize);
+    // Calculate number of batches (1 batch now processes all wallets in parallel)
+    const transactionsPerWallet = argv.count;
+    const totalTransactions = transactionsPerWallet * walletConfigs.length;
 
     log(`\n===== BRIDGE AUTOMATION STARTING =====`, true);
     log(
-      `Total transactions: ${totalTransactions} in ${numBatches} batches`,
+      `Total transactions: ${totalTransactions} (${transactionsPerWallet} per wallet × ${walletConfigs.length} wallets)`,
       true
     );
     log(`From: ${sourceChain.name} To: ${destinationChain.name}`, true);
     log(`Token: ${token.symbol} (${token.address})`, true);
     log(`Amount per transaction: ${argv.amount}`, true);
-    log(`Receiver address: ${argv.receiver}`, true);
 
-    // Execute batches
-    const batchResults = [];
-
-    for (let i = 0; i < numBatches; i++) {
-      const batchId = `${i + 1}`;
-      const batchCount = Math.min(batchSize, totalTransactions - i * batchSize);
+    // Display wallet info
+    walletConfigs.forEach((wallet, index) => {
+      // Create a temporary provider to get wallet address
+      const provider = new ethers.JsonRpcProvider(sourceChain.rpcUrl);
+      const ethersWallet = new ethers.Wallet(wallet.privateKey, provider);
 
       log(
-        `\nStarting batch ${
-          i + 1
-        } of ${numBatches} with ${batchCount} transactions`,
+        `Wallet ${index + 1}: ${ethersWallet.address.substring(0, 8)}...`,
         true
       );
+      log(
+        `  → ${destinationChain.name} Receiver: ${getReceiverAddress(
+          wallet,
+          destinationChain.name
+        )}`,
+        true
+      );
+    });
 
-      // For large batches, do a quick RPC health check before starting
-      if (!argv.skipHealthCheck && i > 0 && i % 5 === 0) {
-        log("Performing quick RPC health check before next batch...", true);
-        let rpcUrls = [sourceChain.rpcUrl];
-        if (sourceChain.alternativeRpcUrls) {
-          rpcUrls = rpcUrls.concat(sourceChain.alternativeRpcUrls);
-        }
+    log(`Max parallel wallet executions: ${argv.maxParallel}`, true);
 
-        const quickHealthResults = await performRpcHealthCheck(rpcUrls, true);
-        const quickHealthyRpcs = quickHealthResults
-          .filter((result) => result.status === "healthy")
-          .map((result) => result.url);
-
-        if (quickHealthyRpcs.length > 0) {
-          sourceChain.rpcUrl = quickHealthyRpcs[0];
-          sourceChain.alternativeRpcUrls = quickHealthyRpcs.slice(1);
-          log(`Updated primary RPC to: ${sourceChain.rpcUrl}`, true);
-        }
-      }
-
-      const batchResult = await executeBatch({
-        sourceChain,
-        destinationChain,
-        token,
-        amount: argv.amount,
-        senderKeys,
-        receiverAddress: argv.receiver,
-        count: batchCount,
-        batchSize,
-        delay: argv.delay,
-        batchId,
-      });
-
-      batchResults.push(batchResult);
-
-      // Wait between batches
-      if (i < numBatches - 1) {
-        const batchDelay = argv.delay * 2; // Longer delay between batches
-        log(
-          `\nBatch ${
-            i + 1
-          } completed. Waiting ${batchDelay}ms before next batch...`,
-          true
-        );
-        await sleep(batchDelay);
-
-        // For large numbers of transactions, perform additional RPC health checks
-        if (!argv.skipHealthCheck && totalTransactions > 50 && i % 2 === 1) {
-          log("Re-checking RPC health before next batch...", true);
-          let rpcUrls = [sourceChain.rpcUrl];
-          if (sourceChain.alternativeRpcUrls) {
-            rpcUrls = rpcUrls.concat(sourceChain.alternativeRpcUrls);
-          }
-
-          const updatedHealthResults = await performRpcHealthCheck(
-            rpcUrls,
-            true
-          );
-          const updatedHealthyRpcs = updatedHealthResults
-            .filter((result) => result.status === "healthy")
-            .map((result) => result.url);
-
-          if (updatedHealthyRpcs.length > 0) {
-            sourceChain.rpcUrl = updatedHealthyRpcs[0];
-            sourceChain.alternativeRpcUrls = updatedHealthyRpcs.slice(1);
-            log(`Updated primary RPC to: ${sourceChain.rpcUrl}`, true);
-          }
-        }
-
-        // Clear provider cache between batches to ensure fresh connections
-        if (i % 3 === 2) {
-          // Every third batch
-          log("Clearing provider cache to ensure fresh connections", true);
-          providerCache.clear();
-        }
-      }
-    }
+    // Execute transactions for all wallets in parallel
+    const batchResult = await executeParallelTransactions({
+      sourceChain,
+      destinationChain,
+      token,
+      amount: argv.amount,
+      walletConfigs,
+      count: transactionsPerWallet,
+      delay: argv.delay,
+      batchId: 1,
+      maxParallel: argv.maxParallel,
+    });
 
     // Summarize results
-    const totalSuccessful = batchResults.reduce(
-      (sum, batch) => sum + batch.successful,
-      0
-    );
-    const totalFailed = batchResults.reduce(
-      (sum, batch) => sum + batch.failed,
-      0
-    );
-
     log("\n===== BRIDGE AUTOMATION COMPLETED =====", true);
     log(`Total transactions: ${totalTransactions}`, true);
-    log(`Successful: ${totalSuccessful}`, true);
-    log(`Failed: ${totalFailed}`, true);
+    log(`Successful: ${batchResult.successful}`, true);
+    log(`Failed: ${batchResult.failed}`, true);
     log(
-      `Success rate: ${((totalSuccessful / totalTransactions) * 100).toFixed(
-        2
-      )}%`,
+      `Success rate: ${(
+        (batchResult.successful / totalTransactions) *
+        100
+      ).toFixed(2)}%`,
       true
     );
 
@@ -1266,8 +1462,11 @@ if (require.main === module) {
 
 module.exports = {
   executeBridgeTransaction,
-  executeBatch,
+  executeParallelTransactions,
   connectToRPC,
   performRpcHealthCheck,
   isConnectionError,
+  isNonceError,
+  loadWalletConfigurations,
+  getReceiverAddress,
 };
