@@ -7,6 +7,8 @@ const fs = require("fs");
 const path = require("path");
 const chains = require("./config/chains");
 const tokens = require("./config/tokens");
+const { sleep, recordTransaction } = require("./utils/transactions");
+const { getWallet, checkWalletBalance } = require("./utils/wallets");
 
 // Load the transaction counter
 const TransactionCounter = require("./transaction-counter");
@@ -88,12 +90,40 @@ const argv = yargs(hideBin(process.argv))
     type: "boolean",
     default: false,
   })
+  .option("suppressConnectionLogs", {
+    description: "Suppress internal connection logs",
+    type: "boolean",
+    default: true,
+  })
+  .option("skipHealthCheck", {
+    description: "Skip RPC health check",
+    type: "boolean",
+    default: false,
+  })
   .help()
   .alias("help", "h")
   .parse();
 
-// Helper function to wait/sleep
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+// Provider cache to avoid creating new connections
+const providerCache = new Map();
+
+// Suppress internal ethers.js connection logs if requested
+if (argv.suppressConnectionLogs) {
+  const originalConsoleLog = console.log;
+  console.log = function () {
+    const msg = arguments[0];
+    if (
+      typeof msg === "string" &&
+      (msg.includes("JsonRpcProvider failed to detect network") ||
+        msg.includes("getNetwork") ||
+        msg.includes("retry in"))
+    ) {
+      // Suppress these messages
+      return;
+    }
+    originalConsoleLog.apply(console, arguments);
+  };
+}
 
 // Minimal logging function that respects verbose mode
 function log(message, forceShow = false) {
@@ -105,6 +135,48 @@ function log(message, forceShow = false) {
 // Always log errors
 function logError(message) {
   console.error(message);
+}
+
+// Simple progress indicator
+function showProgress(message) {
+  if (!argv.verbose) return { complete: () => {} };
+
+  process.stdout.write(`${message}... `);
+
+  const spinner = ["|", "/", "-", "\\"];
+  let i = 0;
+
+  const intervalId = setInterval(() => {
+    process.stdout.write(`\b${spinner[i++ % spinner.length]}`);
+  }, 100);
+
+  return {
+    complete: (completionMessage) => {
+      clearInterval(intervalId);
+      process.stdout.write(`\b${completionMessage}\n`);
+    },
+  };
+}
+
+// Helper function to handle promises with timeout
+async function withTimeout(promise, timeoutMs, errorMessage) {
+  let timeoutId;
+  const timeoutPromise = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => {
+      reject(
+        new Error(errorMessage || `Operation timed out after ${timeoutMs}ms`)
+      );
+    }, timeoutMs);
+  });
+
+  try {
+    const result = await Promise.race([promise, timeoutPromise]);
+    clearTimeout(timeoutId);
+    return result;
+  } catch (error) {
+    clearTimeout(timeoutId);
+    throw error;
+  }
 }
 
 // Load sender private keys
@@ -135,20 +207,148 @@ const loadSenderKeys = () => {
   return [...new Set(keys)];
 };
 
-// Get wallet from private key
-const getWallet = (privateKey, provider) => {
-  try {
-    return new ethers.Wallet(privateKey, provider);
-  } catch (error) {
-    logError(`Failed to create wallet: ${error.message}`);
-    throw error;
-  }
-};
+// Helper function to check if an error is related to connection issues
+function isConnectionError(errorMsg) {
+  if (!errorMsg) return false;
 
-// Try to connect to an RPC provider with fallbacks
-async function connectToRPC(rpcUrls) {
+  const connectionErrorPatterns = [
+    "502",
+    "503",
+    "504",
+    "429",
+    "timeout",
+    "timed out",
+    "network error",
+    "connection",
+    "CONNECTION_ERROR",
+    "SERVER_ERROR",
+    "Bad Gateway",
+    "Gateway Timeout",
+    "Service Unavailable",
+    "Too Many Requests",
+  ];
+
+  return connectionErrorPatterns.some((pattern) =>
+    errorMsg.toString().toLowerCase().includes(pattern.toLowerCase())
+  );
+}
+
+// Perform a health check on RPC endpoints to identify the most reliable ones
+async function performRpcHealthCheck(rpcUrls, quickCheck = false) {
   if (!Array.isArray(rpcUrls)) {
     rpcUrls = [rpcUrls];
+  }
+
+  log("Performing RPC health check...", true);
+
+  // For quick checks, only check the first few RPCs
+  if (quickCheck && rpcUrls.length > 3) {
+    rpcUrls = rpcUrls.slice(0, 3);
+    log(`Quick check mode: only checking first 3 RPCs`, true);
+  }
+
+  const results = [];
+
+  // Add timeout for each health check
+  const checkPromises = rpcUrls.map(async (url) => {
+    try {
+      const startTime = Date.now();
+
+      // Create provider with minimal configuration and explicit network
+      const provider = new ethers.JsonRpcProvider(
+        url,
+        {
+          name: "sepolia",
+          chainId: 11155111,
+        },
+        {
+          batchMaxCount: 1,
+          polling: false,
+          staticNetwork: true,
+          maxRetries: 1,
+        }
+      );
+
+      // Use Promise.race with a timeout
+      const blockNumber = await withTimeout(
+        provider.getBlockNumber(),
+        5000,
+        `RPC call to ${url} timed out after 5000ms`
+      );
+
+      const responseTime = Date.now() - startTime;
+
+      return {
+        url,
+        status: "healthy",
+        responseTime,
+        blockNumber,
+      };
+    } catch (error) {
+      return {
+        url,
+        status: "unhealthy",
+        error: error.message,
+      };
+    }
+  });
+
+  // Execute all checks in parallel
+  const checkResults = await Promise.all(checkPromises);
+  results.push(...checkResults);
+
+  // Sort results by status (healthy first) and response time
+  results.sort((a, b) => {
+    if (a.status === "healthy" && b.status !== "healthy") return -1;
+    if (a.status !== "healthy" && b.status === "healthy") return 1;
+    if (a.status === "healthy" && b.status === "healthy") {
+      return a.responseTime - b.responseTime;
+    }
+    return 0;
+  });
+
+  // Log results
+  for (const result of results) {
+    if (result.status === "healthy") {
+      log(
+        `RPC ${result.url} is healthy (${result.responseTime}ms, block #${result.blockNumber})`,
+        true
+      );
+    } else {
+      log(`RPC ${result.url} is unhealthy: ${result.error}`, true);
+    }
+  }
+
+  return results;
+}
+
+// Try to connect to an RPC provider with fallbacks and exponential backoff
+async function connectToRPC(rpcUrls, maxRetries = 3, forceRefresh = false) {
+  if (!Array.isArray(rpcUrls)) {
+    rpcUrls = [rpcUrls];
+  }
+
+  // Check cache first if not forcing refresh
+  if (!forceRefresh) {
+    for (const url of rpcUrls) {
+      const cachedProvider = providerCache.get(url);
+      if (cachedProvider) {
+        try {
+          // Verify the cached provider is still working
+          await withTimeout(
+            cachedProvider.getBlockNumber(),
+            3000,
+            "Cached provider verification timeout"
+          );
+          log(`Using cached provider for ${url}`, true);
+          return cachedProvider;
+        } catch (error) {
+          // Provider is stale, remove from cache
+          providerCache.delete(url);
+          log(`Cached provider for ${url} is stale, reconnecting...`, true);
+        }
+      }
+    }
   }
 
   // Add default fallbacks if not enough provided
@@ -157,29 +357,91 @@ async function connectToRPC(rpcUrls) {
       ...rpcUrls,
       "https://ethereum-sepolia.publicnode.com",
       "https://rpc.sepolia.org",
-      "https://sepolia.infura.io/v3/9aa3d95b3bc440fa88ea12eaa4456161", // Public Infura key
     ];
   }
 
+  // Outer loop for RPC URLs
   for (const url of rpcUrls) {
-    try {
-      log(`Trying to connect to RPC: ${url}`, true);
+    // Inner loop for retries on the same URL
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        log(
+          `Trying to connect to RPC: ${url} (attempt ${attempt}/${maxRetries})`,
+          true
+        );
 
-      // Create provider with batching disabled
-      const provider = new ethers.JsonRpcProvider(url, undefined, {
-        batchMaxCount: 1, // Disable batching to avoid free tier limits
-        polling: true,
-        pollingInterval: 4000, // Increase polling interval to reduce requests
-        staticNetwork: true, // Avoid extra getNetwork calls
-      });
+        // Create provider with improved settings and explicit network
+        const provider = new ethers.JsonRpcProvider(
+          url,
+          {
+            name: "sepolia",
+            chainId: 11155111,
+          },
+          {
+            batchMaxCount: 1, // Disable batching to avoid free tier limits
+            polling: false, // Disable polling to reduce connection attempts
+            staticNetwork: true, // Avoid extra getNetwork calls
+            cacheTimeout: 0, // Disable cache for critical operations
+            maxRetries: 1, // Reduce internal retries
+            allowGzip: true, // Enable compression if supported
+          }
+        );
 
-      // Test the connection with a simple call
-      const blockNumber = await provider.getBlockNumber();
-      log(`Successfully connected to ${url} (Block #${blockNumber})`, true);
+        // Test the connection with a simple call
+        const blockNumber = await withTimeout(
+          provider.getBlockNumber(),
+          5000,
+          `RPC call to ${url} timed out after 5000ms`
+        );
 
-      return provider;
-    } catch (error) {
-      logError(`Failed to connect to RPC ${url}: ${error.message}`);
+        log(`Successfully connected to ${url} (Block #${blockNumber})`, true);
+
+        // Add a property to track the RPC URL this provider is using
+        provider.rpcUrl = url;
+
+        // Cache the provider for future use
+        providerCache.set(url, provider);
+
+        return provider;
+      } catch (error) {
+        const errorMsg = error.message || "Unknown error";
+
+        // Check for specific error messages that indicate we should try a different RPC
+        const fatalErrors = [
+          "network does not support",
+          "invalid project id",
+          "unauthorized",
+          "exceeded maximum",
+          "rate limit",
+        ];
+
+        const isFatalError = fatalErrors.some((msg) =>
+          errorMsg.toLowerCase().includes(msg.toLowerCase())
+        );
+
+        if (isFatalError) {
+          logError(
+            `Fatal error with RPC ${url}: ${errorMsg}. Trying next RPC.`
+          );
+          break; // Exit inner retry loop, move to next RPC
+        }
+
+        if (attempt === maxRetries) {
+          logError(
+            `Failed to connect to RPC ${url} after ${maxRetries} attempts: ${errorMsg}`
+          );
+        } else {
+          // Only for non-fatal errors, retry with backoff
+          const backoffTime = Math.min(
+            1000 * Math.pow(1.5, attempt - 1),
+            10000
+          );
+          log(
+            `RPC connection failed (${errorMsg}). Retrying in ${backoffTime}ms...`
+          );
+          await sleep(backoffTime);
+        }
+      }
     }
   }
 
@@ -200,6 +462,11 @@ async function executeBridgeTransaction(params) {
     batchId,
     transactionIndex,
   } = params;
+
+  let provider = null;
+  let reconnectAttempts = 0;
+  const MAX_RECONNECT_ATTEMPTS = 3;
+  let lastProvider = null; // For caching
 
   try {
     log(
@@ -237,7 +504,67 @@ async function executeBridgeTransaction(params) {
       rpcUrls = rpcUrls.concat(sourceChain.alternativeRpcUrls);
     }
 
-    const provider = await connectToRPC(rpcUrls);
+    // Function to handle RPC operations with reconnection logic
+    async function executeWithReconnect(operation) {
+      while (reconnectAttempts <= MAX_RECONNECT_ATTEMPTS) {
+        try {
+          // Ensure we have a provider, reuse if possible
+          if (!provider && lastProvider) {
+            try {
+              // Try to reuse the last provider
+              await withTimeout(
+                lastProvider.getBlockNumber(),
+                3000,
+                "Provider reuse verification timeout"
+              );
+              provider = lastProvider;
+              log(`Reusing last working provider`, true);
+            } catch (error) {
+              // Last provider is not working, get a new one
+              provider = await connectToRPC(rpcUrls);
+              lastProvider = provider;
+            }
+          } else if (!provider) {
+            provider = await connectToRPC(rpcUrls);
+            lastProvider = provider;
+          }
+
+          // Execute the operation
+          return await operation(provider);
+        } catch (error) {
+          // Check if this is an RPC connection error
+          if (isConnectionError(error.message)) {
+            reconnectAttempts++;
+            logError(`RPC connection error: ${error.message}`);
+
+            if (reconnectAttempts <= MAX_RECONNECT_ATTEMPTS) {
+              log(
+                `Attempting to reconnect (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`
+              );
+              // Reset provider to force reconnection
+              provider = null;
+              // Add a delay before reconnecting
+              await sleep(2000 * reconnectAttempts);
+            } else {
+              throw new Error(
+                `Max reconnection attempts reached: ${error.message}`
+              );
+            }
+          } else {
+            // Not a connection error, rethrow
+            throw error;
+          }
+        }
+      }
+    }
+
+    // Use our reconnection wrapper for all provider operations
+    provider = await executeWithReconnect(async () => {
+      return await connectToRPC(rpcUrls);
+    });
+
+    lastProvider = provider; // Save for potential reuse
+
     const wallet = getWallet(senderKey, provider);
     log(`Connected with address: ${wallet.address}`);
 
@@ -256,15 +583,25 @@ async function executeBridgeTransaction(params) {
     ];
     const tokenContract = new ethers.Contract(token.address, tokenABI, wallet);
 
-    // Check balances
-    const ethBalance = await provider.getBalance(wallet.address);
+    // Check balances with reconnection logic
+    const progressBalances = showProgress("Checking wallet balances");
+    const ethBalance = await executeWithReconnect(async (provider) => {
+      return await provider.getBalance(wallet.address);
+    });
+    progressBalances.complete("Done");
+
     log(`ETH balance: ${ethers.formatEther(ethBalance)} ETH`);
 
     // Add a small delay between operations
     await sleep(500);
 
-    // Check token balance
-    const tokenBalance = await tokenContract.balanceOf(wallet.address);
+    // Check token balance with reconnection logic
+    const progressTokens = showProgress("Checking token balance");
+    const tokenBalance = await executeWithReconnect(async () => {
+      return await tokenContract.balanceOf(wallet.address);
+    });
+    progressTokens.complete("Done");
+
     log(
       `Token balance: ${ethers.formatUnits(tokenBalance, token.decimals)} ${
         token.symbol
@@ -285,11 +622,16 @@ async function executeBridgeTransaction(params) {
     // Add a small delay between operations
     await sleep(500);
 
-    // Check and approve token allowance if needed
-    const allowance = await tokenContract.allowance(
-      wallet.address,
-      sourceChain.contractAddress
-    );
+    // Check and approve token allowance if needed with reconnection logic
+    const progressAllowance = showProgress("Checking token allowance");
+    const allowance = await executeWithReconnect(async () => {
+      return await tokenContract.allowance(
+        wallet.address,
+        sourceChain.contractAddress
+      );
+    });
+    progressAllowance.complete("Done");
+
     log(`Token allowance: ${ethers.formatUnits(allowance, token.decimals)}`);
 
     if (allowance < amountInSmallestUnit) {
@@ -298,14 +640,25 @@ async function executeBridgeTransaction(params) {
       if (argv.dryRun) {
         log("[DRY RUN] Would approve token spending");
       } else {
-        const approveTx = await tokenContract.approve(
-          sourceChain.contractAddress,
-          amountInSmallestUnit
-        );
+        const progressApprove = showProgress("Sending approval transaction");
+        const approveTx = await executeWithReconnect(async () => {
+          return await tokenContract.approve(
+            sourceChain.contractAddress,
+            amountInSmallestUnit
+          );
+        });
+        progressApprove.complete("Sent");
+
         log(`Approval transaction submitted: ${approveTx.hash}`);
 
-        log("Waiting for approval confirmation...");
-        const approveReceipt = await approveTx.wait();
+        const progressConfirm = showProgress(
+          "Waiting for approval confirmation"
+        );
+        const approveReceipt = await executeWithReconnect(async () => {
+          return await approveTx.wait();
+        });
+        progressConfirm.complete("Confirmed");
+
         log(`Approval confirmed in block ${approveReceipt.blockNumber}`);
       }
     } else {
@@ -418,12 +771,26 @@ async function executeBridgeTransaction(params) {
         true
       );
 
-      const txResponse = await wallet.sendTransaction(tx);
+      // Send transaction with reconnection logic
+      const progressSend = showProgress("Sending bridge transaction");
+      const txResponse = await executeWithReconnect(async () => {
+        return await wallet.sendTransaction(tx);
+      });
+      progressSend.complete("Sent");
+
       txHash = txResponse.hash;
       log(`Transaction submitted: ${txHash}`);
 
       log("Waiting for confirmation...");
-      txReceipt = await txResponse.wait();
+
+      // Wait for confirmation with reconnection logic
+      const progressConfirm = showProgress(
+        "Waiting for transaction confirmation"
+      );
+      txReceipt = await executeWithReconnect(async () => {
+        return await txResponse.wait();
+      });
+      progressConfirm.complete("Confirmed");
 
       // Show minimal confirmation of success
       log(`Transaction ${txHash.substring(0, 8)}... confirmed!`, true);
@@ -431,9 +798,39 @@ async function executeBridgeTransaction(params) {
       // Record the transaction result silently
       if (txReceipt.status === 1) {
         counter.recordTransaction(wallet.address, destinationChain.name, true);
+
+        // Record detailed transaction info
+        await recordTransaction({
+          txHash,
+          from: wallet.address,
+          to: receiverAddress,
+          token: token.symbol,
+          amount,
+          sourceChain: sourceChain.name,
+          destinationChain: destinationChain.name,
+          status: "SUCCESS",
+          blockNumber: txReceipt.blockNumber,
+          gasUsed: txReceipt.gasUsed?.toString() || "0",
+          batchId,
+        });
       } else {
         counter.recordTransaction(wallet.address, destinationChain.name, false);
         logError(`Transaction failed: ${txHash}`);
+
+        // Record failed transaction
+        await recordTransaction({
+          txHash,
+          from: wallet.address,
+          to: receiverAddress,
+          token: token.symbol,
+          amount,
+          sourceChain: sourceChain.name,
+          destinationChain: destinationChain.name,
+          status: "FAILED",
+          blockNumber: txReceipt.blockNumber,
+          gasUsed: txReceipt.gasUsed?.toString() || "0",
+          batchId,
+        });
       }
     }
 
@@ -452,9 +849,14 @@ async function executeBridgeTransaction(params) {
         // Try to create a minimal provider just for this operation
         const provider = new ethers.JsonRpcProvider(
           "https://ethereum-sepolia.publicnode.com",
-          undefined,
+          {
+            name: "sepolia",
+            chainId: 11155111,
+          },
           {
             batchMaxCount: 1,
+            polling: false,
+            staticNetwork: true,
           }
         );
         const wallet = getWallet(params.senderKey, provider);
@@ -464,6 +866,22 @@ async function executeBridgeTransaction(params) {
           params.destinationChain.name,
           false
         );
+
+        // Record detailed transaction failure
+        await recordTransaction({
+          txHash: "ERROR",
+          from: wallet.address,
+          to: receiverAddress,
+          token: token.symbol,
+          amount,
+          sourceChain: sourceChain.name,
+          destinationChain: destinationChain.name,
+          status: "ERROR",
+          blockNumber: 0,
+          gasUsed: "0",
+          batchId,
+          error: error.message,
+        });
       } catch (innerError) {
         logError(`Could not record failure: ${innerError.message}`);
       }
@@ -475,6 +893,7 @@ async function executeBridgeTransaction(params) {
     };
   }
 }
+
 // Execute a batch of transactions
 async function executeBatch(params) {
   const {
@@ -505,45 +924,79 @@ async function executeBatch(params) {
   // Round-robin through sender keys
   for (let i = 0; i < count; i++) {
     const senderKey = senderKeys[i % senderKeys.length];
+    let attempts = 0;
+    const maxAttempts = 3;
+    let success = false;
 
-    try {
-      const result = await executeBridgeTransaction({
-        sourceChain,
-        destinationChain,
-        token,
-        amount,
-        senderKey,
-        receiverAddress,
-        batchId,
-        transactionIndex: i,
-      });
+    while (attempts < maxAttempts && !success) {
+      attempts++;
+      try {
+        const result = await executeBridgeTransaction({
+          sourceChain,
+          destinationChain,
+          token,
+          amount,
+          senderKey,
+          receiverAddress,
+          batchId,
+          transactionIndex: i,
+        });
 
-      results.transactions.push(result);
+        results.transactions.push(result);
 
-      if (result.success) {
-        results.successful++;
-      } else {
-        results.failed++;
+        if (result.success) {
+          results.successful++;
+          success = true;
+        } else {
+          // If it's not a connection error, don't retry
+          if (!result.error || !isConnectionError(result.error)) {
+            results.failed++;
+            break;
+          }
+
+          // For connection errors, we retry
+          logError(
+            `Transaction attempt ${attempts}/${maxAttempts} failed with connection error. Retrying...`
+          );
+
+          // Wait longer before retrying
+          await sleep(delay * attempts);
+        }
+      } catch (error) {
+        logError(
+          `Error executing transaction ${
+            i + 1
+          } (attempt ${attempts}/${maxAttempts}): ${error.message}`
+        );
+
+        // If it's not a connection error, don't retry
+        if (!isConnectionError(error.message)) {
+          results.failed++;
+          results.transactions.push({
+            success: false,
+            error: error.message,
+          });
+          break;
+        }
+
+        // For the last attempt, record the failure
+        if (attempts === maxAttempts) {
+          results.failed++;
+          results.transactions.push({
+            success: false,
+            error: error.message,
+          });
+        }
+
+        // Wait longer before retrying
+        await sleep(delay * attempts);
       }
+    }
 
-      // Wait between transactions to avoid rate limiting
-      if (i < count - 1) {
-        log(`Waiting ${delay}ms before next transaction...`);
-        await sleep(delay);
-      }
-    } catch (error) {
-      logError(`Error executing transaction ${i + 1}: ${error.message}`);
-      results.failed++;
-      results.transactions.push({
-        success: false,
-        error: error.message,
-      });
-
-      // Wait between transactions even on error
-      if (i < count - 1) {
-        log(`Waiting ${delay}ms before next transaction...`);
-        await sleep(delay);
-      }
+    // Wait between transactions
+    if (i < count - 1) {
+      log(`Waiting ${delay}ms before next transaction...`);
+      await sleep(delay);
     }
   }
 
@@ -585,9 +1038,82 @@ async function main() {
     const destinationChain = chains[argv.destination];
     const token = tokens[argv.token];
 
+    // Perform RPC health check if not skipped
+    if (!argv.skipHealthCheck) {
+      // Collect RPC URLs
+      let rpcUrls = [sourceChain.rpcUrl];
+      if (sourceChain.alternativeRpcUrls) {
+        rpcUrls = rpcUrls.concat(sourceChain.alternativeRpcUrls);
+      }
+
+      // Add more public RPCs for health check
+      rpcUrls = [
+        ...rpcUrls,
+        "https://ethereum-sepolia.publicnode.com",
+        "https://rpc.sepolia.org",
+        "https://sepolia.infura.io/v3/9aa3d95b3bc440fa88ea12eaa4456161", // Public Infura key
+        "https://eth-sepolia.g.alchemy.com/v2/demo", // Alchemy public key
+      ];
+
+      // Remove duplicates
+      rpcUrls = [...new Set(rpcUrls)];
+
+      const healthResults = await performRpcHealthCheck(rpcUrls);
+
+      // Update the chain config with ordered RPC URLs based on health check
+      const healthyRpcs = healthResults
+        .filter((result) => result.status === "healthy")
+        .map((result) => result.url);
+
+      if (healthyRpcs.length > 0) {
+        sourceChain.rpcUrl = healthyRpcs[0]; // Set primary RPC to healthiest
+        sourceChain.alternativeRpcUrls = healthyRpcs.slice(1); // Set rest as alternatives
+
+        // Pre-create and cache a provider for the primary RPC
+        try {
+          const primaryProvider = new ethers.JsonRpcProvider(
+            sourceChain.rpcUrl,
+            {
+              name: "sepolia",
+              chainId: 11155111,
+            },
+            {
+              batchMaxCount: 1,
+              polling: false,
+              staticNetwork: true,
+            }
+          );
+
+          // Warm up the provider
+          await withTimeout(
+            primaryProvider.getBlockNumber(),
+            5000,
+            "Provider warm-up timeout"
+          );
+          providerCache.set(sourceChain.rpcUrl, primaryProvider);
+          log(`Pre-cached primary provider for ${sourceChain.rpcUrl}`, true);
+        } catch (error) {
+          log(`Failed to pre-cache provider: ${error.message}`, true);
+        }
+
+        log(`Using primary RPC: ${sourceChain.rpcUrl}`, true);
+        log(
+          `Available backup RPCs: ${sourceChain.alternativeRpcUrls.length}`,
+          true
+        );
+      } else {
+        log(
+          "Warning: No healthy RPCs found in health check. Proceeding with original configuration.",
+          true
+        );
+      }
+    } else {
+      log("RPC health check skipped as requested", true);
+    }
+
     // Calculate number of batches
     const totalTransactions = argv.count;
-    const batchSize = argv.batchSize;
+    const batchSize = Math.min(argv.batchSize, 10); // Limit batch size to 10 for stability
     const numBatches = Math.ceil(totalTransactions / batchSize);
 
     log(`\n===== BRIDGE AUTOMATION STARTING =====`, true);
@@ -614,6 +1140,26 @@ async function main() {
         true
       );
 
+      // For large batches, do a quick RPC health check before starting
+      if (!argv.skipHealthCheck && i > 0 && i % 5 === 0) {
+        log("Performing quick RPC health check before next batch...", true);
+        let rpcUrls = [sourceChain.rpcUrl];
+        if (sourceChain.alternativeRpcUrls) {
+          rpcUrls = rpcUrls.concat(sourceChain.alternativeRpcUrls);
+        }
+
+        const quickHealthResults = await performRpcHealthCheck(rpcUrls, true);
+        const quickHealthyRpcs = quickHealthResults
+          .filter((result) => result.status === "healthy")
+          .map((result) => result.url);
+
+        if (quickHealthyRpcs.length > 0) {
+          sourceChain.rpcUrl = quickHealthyRpcs[0];
+          sourceChain.alternativeRpcUrls = quickHealthyRpcs.slice(1);
+          log(`Updated primary RPC to: ${sourceChain.rpcUrl}`, true);
+        }
+      }
+
       const batchResult = await executeBatch({
         sourceChain,
         destinationChain,
@@ -639,6 +1185,36 @@ async function main() {
           true
         );
         await sleep(batchDelay);
+
+        // For large numbers of transactions, perform additional RPC health checks
+        if (!argv.skipHealthCheck && totalTransactions > 50 && i % 2 === 1) {
+          log("Re-checking RPC health before next batch...", true);
+          let rpcUrls = [sourceChain.rpcUrl];
+          if (sourceChain.alternativeRpcUrls) {
+            rpcUrls = rpcUrls.concat(sourceChain.alternativeRpcUrls);
+          }
+
+          const updatedHealthResults = await performRpcHealthCheck(
+            rpcUrls,
+            true
+          );
+          const updatedHealthyRpcs = updatedHealthResults
+            .filter((result) => result.status === "healthy")
+            .map((result) => result.url);
+
+          if (updatedHealthyRpcs.length > 0) {
+            sourceChain.rpcUrl = updatedHealthyRpcs[0];
+            sourceChain.alternativeRpcUrls = updatedHealthyRpcs.slice(1);
+            log(`Updated primary RPC to: ${sourceChain.rpcUrl}`, true);
+          }
+        }
+
+        // Clear provider cache between batches to ensure fresh connections
+        if (i % 3 === 2) {
+          // Every third batch
+          log("Clearing provider cache to ensure fresh connections", true);
+          providerCache.clear();
+        }
       }
     }
 
@@ -687,3 +1263,11 @@ if (require.main === module) {
       process.exit(1);
     });
 }
+
+module.exports = {
+  executeBridgeTransaction,
+  executeBatch,
+  connectToRPC,
+  performRpcHealthCheck,
+  isConnectionError,
+};

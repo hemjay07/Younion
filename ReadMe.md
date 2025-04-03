@@ -50,7 +50,7 @@ node bridge.js --destination babylon --receiver bbn1hvctyj6tcw8tlxkv97p5k60cprr3
 Send 10 transactions with 5 second delay between each:
 
 ```bash
-node bridge.js --destination babylon --receiver bbn1hvctyj6tcw8tlxkv97p5k60cprr3ypyujdax --count 10 --delay 5000
+node bridge.js --destination babylon --receiver bbn1uax6wtg8ue068l2hqhesecfhufn74xcz83fxtn --count 10 --delay 5000
 ```
 
 ### Using Multiple Wallets
