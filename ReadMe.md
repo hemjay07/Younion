@@ -8,18 +8,33 @@ A streamlined tool for automating token bridge transactions between Sepolia and 
 2. **Install dependencies**
 
 ```bash
-   npm install
+npm install
 ```
 
-3. **Set up your private key**
+3. **Set up your wallet configuration**
 
-- Create a `.env` file with your private key:
+You can configure up to 5 wallets in the `.env` file with their corresponding destination addresses:
 
 ```javascript
-     SENDER_PRIVATE_KEY=0xYourPrivateKeyHere
+# Wallet 1
+WALLET_1_PRIVATE_KEY=0xYourPrivateKeyHere
+WALLET_1_UNION_ADDRESS=union1youraddresshere
+WALLET_1_BABYLON_ADDRESS=bbn1youraddresshere
+
+# Wallet 2 (optional)
+WALLET_2_PRIVATE_KEY=
+WALLET_2_UNION_ADDRESS=
+WALLET_2_BABYLON_ADDRESS=
+
+# Add up to 5 wallet configurations following the same pattern
+# Add more wallets as needed (up to WALLET_5_*)
 ```
 
-- Or create a `sender-keys.txt` file with multiple keys (one per line)
+Alternatively, for simple usage with a single wallet:
+
+```javascript
+SENDER_PRIVATE_KEY=0xYourPrivateKeyHere
+```
 
 ## Usage Examples
 
@@ -28,13 +43,13 @@ A streamlined tool for automating token bridge transactions between Sepolia and 
 Bridge 0.000001 USDC from Sepolia to Babylon:
 
 ```bash
-node bridge.js --destination babylon --receiver bbn1hvctyj6tcw8tlxkv97p5k60cprr3ypyujdax
+node bridge.js --destination babylon --count 10
 ```
 
 Bridge to Union Testnet:
 
 ```bash
-node bridge.js --destination union --receiver union1uax6wtg8ue068l2hqhesecfhufn74xcz6cel6m
+node bridge.js --destination union --count 5
 ```
 
 ### Simulation Mode (No Real Transactions)
@@ -42,23 +57,23 @@ node bridge.js --destination union --receiver union1uax6wtg8ue068l2hqhesecfhufn7
 Test the process without sending actual transactions:
 
 ```bash
-node bridge.js --destination babylon --receiver bbn1hvctyj6tcw8tlxkv97p5k60cprr3ypyujdax --count 3 --dryRun
+node bridge.js --destination babylon --count 3 --dryRun
 ```
 
-### Multiple Transactions
+### Control Processing Speed
 
-Send 10 transactions with 5 second delay between each:
+Adjust the delay between transactions:
 
 ```bash
-node bridge.js --destination babylon --receiver bbn1uax6wtg8ue068l2hqhesecfhufn74xcz83fxtn --count 10 --delay 5000
+node bridge.js --destination babylon --count 10 --delay 3000
 ```
 
-### Using Multiple Wallets
+### Parallel Processing
 
-Distribute 20 transactions across wallets in a file:
+When using multiple wallets, control the level of parallelism:
 
 ```bash
-node bridge.js --destination union --receiver union1uax6wtg8ue068l2hqhesecfhufn74xcz6cel6m --senderKeyFile ./sender-keys.txt --count 20 --batchSize 5
+node bridge.js --destination union --count 20 --maxParallel 3
 ```
 
 ### Verbose Output
@@ -66,7 +81,7 @@ node bridge.js --destination union --receiver union1uax6wtg8ue068l2hqhesecfhufn7
 Show detailed logs during execution:
 
 ```bash
-node bridge.js --destination babylon --receiver bbn1hvctyj6tcw8tlxkv97p5k60cprr3ypyujdax --count 20 --verbose
+node bridge.js --destination babylon --count 5 --verbose
 ```
 
 ## Tracking Progress
@@ -93,4 +108,18 @@ node query-progress.js --summary
 
 ## Command Options
 
-Option Alias Description Default `--destination` `-d` Destination chain (babylon/union) _Required_ `--receiver` `-r` Receiver address _Required_ `--source` `-s` Source chain sepolia `--token` `-t` Token to bridge usdc `--amount` `-a` Amount to bridge 0.000001 `--count` `-c` Number of transactions 1 `--batchSize` `-b` Transactions per batch 5 `--delay` `-dl` Delay between transactions (ms) 5000 `--senderKey` `-sk` Sender private key _From .env_ `--senderKeyFile` `-skf` File with private keys _None_ `--dryRun` Simulate without sending false `--verbose` `-v` Show detailed logs false
+Option Alias Description Default `--destination` `-d` Destination chain (babylon/union) _Required_ `--source` `-s` Source chain sepolia `--token` `-t` Token to bridge usdc `--amount` `-a` Amount to bridge 0.000001 `--count` `-c` Number of transactions per wallet 1 `--delay` `-dl` Delay between transactions (ms) 5000 `--maxParallel` Maximum parallel wallet executions 3 `--dryRun` Simulate without sending false `--verbose` `-v` Show detailed logs false `--skipHealthCheck` Skip RPC health check false
+
+## Advanced Features
+
+- **Multi-wallet Support**: Configure up to 5 wallets with their own destination addresses
+- **Parallel Processing**: Transactions from different wallets execute in parallel
+- **Smart Nonce Management**: Prevents nonce conflicts for reliable transaction processing
+- **RPC Health Checks**: Automatically selects the most reliable RPC endpoints
+- **Detailed Transaction Logs**: All transactions are recorded for easy auditing
+
+## Notes
+
+- When using a single wallet, transactions are processed sequentially to ensure proper nonce ordering
+- With multiple wallets, transactions are processed in parallel across different wallets
+- The script automatically handles connection issues and retries failed transactions
